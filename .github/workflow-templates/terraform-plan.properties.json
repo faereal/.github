@@ -3,6 +3,6 @@
     "description": "Starter workflow for running a Terraform Plan on AWS",
     "iconName": "octicon smiley",
     "categories": [
-        "Terraform Template"
+        "deployment"
     ]
 }
