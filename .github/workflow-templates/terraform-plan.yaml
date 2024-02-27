@@ -1,0 +1,24 @@
+---
+name: Terraform Plan for AWS # Name of the workflow
+
+on:
+  workflow_dispatch: # This will allow you to manually run the workflow from the Actions tab (optional
+  pull_request: # This will call the workflow when a pull request is opened or updated to the main branch
+    branches: [ $default-branch ] 
+
+jobs:
+
+  # Demo Plan for AWS - Using a hosted runner launching on ubuntu-latest
+  plan-aws: # Name of the job
+    uses: faereal/.github-private/.github/workflows/terraform-plan.yaml@main # Path to the template
+    secrets: inherit                                                       # Allow the workflow to inherit the secrets from the repo's secrets
+    with:
+      github_runner: '["ubuntu-latest"]'                                   # Specify the runner to use for the job - this example uses a hosted runner
+      directory_path: "terraform"                                          # Directory where the Terraform files are kept
+      node_version: "20"                                                   # Node Version (16 currently minimum for Terraform v1.5.x)
+      terraform_version: "1.5.7"                                           # This value can also be a specific Terraform tag, like "latest", or "beta"
+      environment: "prd"                                                   # This setting will pull the `prd.tfvars` file from the `environments` directory
+      concurrency_group: "aws"                                             # This will allow you to specify the concurrency group for the job - useful in this example as we can run Azure below
+      commit_user: "ET-AWS-Bot"                                            # Name to show on the commit, default is 'github-actions'
+      commit_email: "no-reply@expert-thinking.co.uk"                        # Name on the commit, default is 'no-reply@github.com'
+      backend_config: "primary-state.conf"                                 # This will look for `primary-state.conf` in the `terraform` folder to use as the backend config
