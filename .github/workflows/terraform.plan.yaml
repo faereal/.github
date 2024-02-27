@@ -1,0 +1,579 @@
+---
+name: Terraform Plan
+
+on:
+  workflow_call:
+    inputs:
+      github_runner:
+        description: 'Name of GitHub-hosted runner or self-hosted runner, in the format of a string JSON array'
+        default: '["ubuntu-latest"]'
+        required: false
+        type: string
+      node_version:
+        description: 'The version of NodeJS to install for Terraform to use as part of the pipeline. For example, "16", or "latest". If left blank, it will use the version of node in the PATH'
+        type: string
+        default: '20'
+        required: false
+      terraform_version:
+        description: 'The version of Terraform to use as part of this pipeline. For example, "1.5.7" or "beta"'
+        type: string
+        default: '1.5.7'
+        required: false
+      commit_user:
+        description: 'Username which should be used for commits by GitHub Actions'
+        default: 'github-actions'
+        required: false
+        type: string
+      commit_email:
+        description: 'Email which should be used for commits by GitHub Actions'
+        default: 'noreply@github.com'
+        required: false
+        type: string
+      concurrency_group:
+        description: 'Name of concurrency group to manage concurrent github action runs'
+        default: ${{ github.repository }}/${{ github.event.pull_request.head.ref || github.ref }}
+        required: false
+        type: string
+      directory_path:
+        description: 'The working directory path for CI tasks. For example, "terraform"'
+        default: 'terraform'
+        required: false
+        type: string
+      environment:
+        description: 'The deployment environment, to be passed through to Terrraform via Makefile. For example, "dev"'
+        type: string
+        required: true
+      backend_config:
+        description: 'The backend config file to use for Terraform. For example, "state.conf"'
+        type: string
+        required: false
+        default: ''
+
+env:
+  TF_IN_AUTOMATION: true
+  TF_TOKEN_app_terraform_io: ${{ secrets.TF_CLOUD_API_TOKEN }}
+
+# Ensures that only one workflow runs at a time
+concurrency: ${{ inputs.concurrency_group }}
+
+jobs:
+  ## Run Terraform Format on the repo, and commit back any changes that are made
+  terraform-format:
+    name: Terraform Format
+    runs-on: ${{ fromJSON(inputs.github_runner) }}
+    permissions:
+      contents: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.directory_path }}
+    outputs:
+      terraform-format-outcome: ${{ steps.terraform-fmt.outcome }}
+    steps:
+      - name: Checkout Code
+        id: checkout-code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+
+      - name: Set up NodeJS for Terraform (if required)
+        id: setup-node
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Setup Terraform
+        id: terraform-setup
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Run Terraform Format
+        id: terraform-fmt
+        run: terraform fmt -check -recursive -diff
+
+       # Comment back to the GitHub PR the output of the Terraform Format
+      - name:  Update Pull Request - Terraform Format output
+        if: github.event_name == 'pull_request' && (steps.terraform-fmt.outcome == 'success' || steps.terraform-fmt.outcome == 'failure')
+        uses: GetTerminus/terraform-pr-commenter@v3
+        with:
+          commenter_type: fmt
+          commenter_input: ${{ format('{0}{1}', steps.terraform-fmt.outputs.stdout, steps.terraform-fmt.outputs.stderr) }}
+          commenter_exitcode: ${{ steps.terraform-fmt.outputs.exitcode }}
+
+      - name: Commit Changes
+        id: terraform-fmt-commit
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "terraform-fmt-commit(terraform-format): Terraform Format run against the code"
+          commit_options: "--no-verify --signoff"
+          file_pattern: "terraform/**"
+          commit_user_name: ${{ inputs.commit_user }}}
+          commit_user_email: ${{ inputs.commit_email }}}
+
+  ## Run Terraform Docs on the repo and update if any changes are made
+  terraform-docs:
+   needs:
+     - terraform-format
+   name: Terraform Docs
+   runs-on: ${{ fromJSON(inputs.github_runner) }}
+   permissions:
+     contents: write
+   env:
+     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+   defaults:
+     run:
+       working-directory: ${{ inputs.directory_path }}
+   outputs:
+     terraform-docs-outcome: ${{ steps.terraform-docs.outcome }}
+   steps:
+     - name: Checkout Code
+       id: checkout-code
+       uses: actions/checkout@v4
+       with:
+         ref: ${{ github.head_ref || github.ref_name }}
+     - name: Run Terraform Docs
+       id: terraform-docs
+       # Warning on `set-output` is currently waiting for a PR to resolve
+       # PR: https://github.com/terraform-docs/gh-actions/pull/119
+       uses: terraform-docs/gh-actions@v1.0.0
+       with:
+         working-dir: terraform
+         output-file: README.md
+         output-method: inject
+         args: --sort-by required
+         git-push: true
+         git-push-user-name: ${{ inputs.commit_user }}}
+         git-push-user-email: ${{ inputs.commit_email }}}
+         git-commit-message: "terraform-docs(terraform-docs): Terraform Docs run against the code"
+         template: "<!-- BEGINNING OF PRE-COMMIT-TERRAFORM DOCS HOOK -->\n{{ .Content }}\n<!-- END OF PRE-COMMIT-TERRAFORM DOCS HOOK -->"
+
+  ## Run Terraform Lint on the repo and update the PR if any changes are required
+  terraform-lint:
+    needs:
+      - terraform-format
+      - terraform-docs
+    name: Terraform Lint
+    runs-on: ${{ fromJSON(inputs.github_runner) }}
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        working-directory: .
+    outputs:
+      terraform-lint-outcome: ${{ steps.tflint-run.outcome }}
+    steps:
+      - name: Checkout Code
+        id: checkout-code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+
+      # GitHub Action to run TFLint with ReviewDog for PR comments/checks automatically.
+      # See https://github.com/reviewdog/action-tflint for detail and configuration options
+      - name: Run TFLint
+        uses: reviewdog/action-tflint@v1.21.0
+        id: tflint-run
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-review
+          fail_on_error: false
+          filter_mode: nofilter
+          level: error
+          flags: "--recursive"
+          tflint_init: true
+          # Pinning version due to the following issue: https://github.com/reviewdog/action-tflint/issues/83
+          tflint_version: "v0.49.0"
+
+  ## Run Trivy Security scan using config mode on the repo to check Terraform code for vulnerabilities
+  terraform-trivy:
+    needs:
+      - terraform-format
+      - terraform-docs
+      - terraform-lint
+    name: Trivy - Security Check
+    runs-on: ${{ fromJSON(inputs.github_runner) }}
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+      pull-requests: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.directory_path }}
+    outputs:
+      terraform-trivy-outcome: ${{ steps.trivy-scan.outcome }}
+    steps:
+      - name: Checkout Code
+        id: checkout-code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+
+        #TODO: Move this to a more normal ET based public area. For the moment this will work.
+      - name: Download Trivy template for Markdown and GitHub
+        id: download-trivy-template
+        run: |
+          curl -sL https://raw.githubusercontent.com/mystcb/trivy-markdown-github-template/main/github-markdown.tpl -o github-markdown.tpl
+
+      - name: Run Trivy vulnerability scanner in repo mode
+        id: trivy-scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          hide-progress: false
+          ignore-unfixed: true
+          format: template
+          template: '@terraform/github-markdown.tpl'
+          output: "trivy.md"
+          # format: 'sarif'
+          # output: 'trivy-results.sarif'
+          severity: CRITICAL,HIGH
+          tf-vars: "environments/${{ inputs.environment }}.tfvars"
+          exit-code: 1
+
+      - name: Output the Trivy scan results into the GitHub output for a PR comment
+        id: trivy-scan-convert
+        if: always()
+        run: |
+          {
+            echo 'TRIVY_OUTPUT<<EOF'
+            cat ../trivy.md
+            echo EOF
+          } >> $GITHUB_OUTPUT
+
+      - name: Trivy Output
+        id: trivy-scan-step-summary
+        if: always()
+        run: cat ../trivy.md >> $GITHUB_STEP_SUMMARY
+
+      # Requires GH enterprise and advanced security subscription. Disabled for now
+      # - name: Upload Trivy scan results to GitHub Security tab
+      #   uses: github/codeql-action/upload-sarif@v2
+      #   with:
+      #     sarif_file: 'trivy-results.sarif'
+
+      # Comment back to the GitHub PR the output of the Trivy Output
+      - name: Update Pull Request
+        id: pr-update
+        uses: actions/github-script@v7
+        if: always() && github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Trivy Security Scan Output 📖
+            <details><summary>Show</summary>
+
+            ${{ steps.trivy-scan-convert.outputs.TRIVY_OUTPUT }}
+
+            </details>
+
+            `;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+  # Run the code through Infracost
+  infracost:
+    needs:
+      - terraform-format
+      - terraform-docs
+      - terraform-lint
+      - terraform-trivy
+    name: Infracost
+    runs-on: ${{ fromJSON(inputs.github_runner) }}
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TF_ROOT: ${{ inputs.directory_path }}
+      INFRACOST_TERRAFORM_CLOUD_TOKEN:  ${{ secrets.TF_CLOUD_API_TOKEN }}
+      INFRACOST_TERRAFORM_CLOUD_HOST: app.terraform.io
+    outputs:
+      infracost-outcome: ${{ steps.infracost-run.outcome }}
+    steps:
+      - name: Check if Infracost API key has been set update
+        id: secret-check
+        run: |
+          if [ "${{ secrets.INFRACOST_API_KEY }}" != '' ]; then
+            echo "available=true" >> $GITHUB_OUTPUT;
+          else
+            echo "available=false" >> $GITHUB_OUTPUT;
+          fi
+
+      - name: Setup Infracost
+        if: ${{ steps.secret-check.outputs.available == 'true' }}
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      # Checkout the base branch of the pull request (e.g. main).
+      - name: Checkout base branch
+        if: ${{ steps.secret-check.outputs.available == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          ref: '${{ github.event.pull_request.base.ref }}'
+
+      # Generate Infracost JSON file as the baseline.
+      - name: Generate Infracost cost estimate baseline
+        if: ${{ steps.secret-check.outputs.available == 'true' }}
+        run: |
+          infracost breakdown --path=${TF_ROOT} \
+                              --format=json \
+                              --out-file=/tmp/infracost-base.json
+
+      # Checkout the current PR branch so we can create a diff.
+      - name: Checkout PR Branch
+        if: ${{ steps.secret-check.outputs.available == 'true' }}
+        id: checkout-code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+
+      # Generate an Infracost diff and save it to a JSON file.
+      - name: Generate Infracost diff
+        if: ${{ steps.secret-check.outputs.available == 'true' }}
+        id: infracost-run
+        run: |
+          infracost diff --path=${TF_ROOT} \
+                          --format=json \
+                          --compare-to=/tmp/infracost-base.json \
+                          --out-file=/tmp/infracost.json
+
+      - name: Post Infracost output to summary
+        id: infracost-output-summary
+        if: ${{ steps.secret-check.outputs.available == 'true' }}
+        run: |
+          infracost diff --path=${TF_ROOT} --compare-to=/tmp/infracost-base.json >> $GITHUB_STEP_SUMMARY
+
+      - name: Post Infracost comment
+        id: infracost-output-github-comment
+        if: github.event_name == 'pull_request' && steps.secret-check.outputs.available == 'true'
+        run: |
+            infracost comment github --path=/tmp/infracost.json \
+                                     --repo=$GITHUB_REPOSITORY \
+                                     --github-token=${{ secrets.GITHUB_TOKEN }} \
+                                     --pull-request=${{github.event.pull_request.number}} \
+                                     --behavior=update
+
+  # If the cloud provider is AWS - then run the AWS Plan
+  terraform-plan:
+    needs:
+     - terraform-format
+     - terraform-docs
+     - terraform-lint
+     - terraform-trivy
+     - infracost
+    name: Terraform Plan
+    runs-on: ${{ fromJSON(inputs.github_runner) }}
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Azure based credentials (if set)
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ENVIRONMENT: ${{ inputs.environment }}
+
+      # AWS based credentials (if set)
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.directory_path }}
+    outputs:
+      terraform-plan-outcome: ${{ steps.terraform-plan-run.outcome }}
+      terraform-plan-id: ${{ steps.terraform-plan-artifact.outputs.artifact_id }}
+    steps:
+      - name: Checkout Code
+        id: checkout-code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+
+      - name: Set up NodeJS for Terraform (if required)
+        id: setup-node
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Setup Terraform
+        id: terraform-setup
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      ## Check to see which variables have been set to enable each cloud authenticator
+      - name: Check to see if the second level ARN has been set
+        id: check-auth-keys
+        run: |
+
+          # Checking to see if the AWS_ROLE_ARN has been set for OIDC authentication with AWS
+          if [ "${{ secrets.AWS_ROLE_ARN }}" != '' ]; then
+            echo "aws-oidc=true" >> $GITHUB_OUTPUT;
+          else
+            echo "aws-oidc=false" >> $GITHUB_OUTPUT;
+          fi
+
+          # Checking to see if the AWS_ROLE_ACCOUNT_ARN has been set to enable role chaining with AWS
+          if [ "${{ secrets.AWS_ROLE_ACCOUNT_ARN }}" != '' ]; then
+            echo "aws-oidc-assume=true" >> $GITHUB_OUTPUT;
+          else
+            echo "aws-oidc-assume=false" >> $GITHUB_OUTPUT;
+          fi
+
+          # Checking to see if the AZURE_CREDENTIALS has been set to enable Azure authentication though the Azure CLI
+          if [ "${{ secrets.AZURE_CREDENTIALS }}" != '' ]; then
+            echo "azure-creds=true" >> $GITHUB_OUTPUT;
+          else
+            echo "azure-creds=false" >> $GITHUB_OUTPUT;
+          fi
+
+      #############################################
+      # Multi Cloud Authentication Steps  - AWS   #
+      #############################################
+
+      ## Authenticate against AWS
+      - name: Configure AWS Credentials
+        if: steps.check-auth-keys.outputs.aws-oidc == 'true'
+        id: aws-credentials-configure-primary
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: aws-primary
+
+      ## Authenticate a second step in AWS if required
+      - name: Configure AWS Credentials (Secondary)
+        if:  steps.check-auth-keys.outputs.aws-oidc == 'true' &&  steps.check-auth-keys.outputs.aws-oidc-assume == 'true'
+        id: aws-credentials-configure-secondary
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ACCOUNT_ARN }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: aws-secondary
+          role-chaining: true
+
+      ###############################################
+      # Multi Cloud Authentication Steps  - Azure   #
+      ###############################################
+
+      - name: Configure Azure Credentials
+        if:  steps.check-auth-keys.outputs.azure-creds == 'true'
+        id: azure-credentials-configure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      ###############################################
+      # Multi Cloud Authentication Steps end        #
+      ###############################################
+
+      - name: Terraform Init
+        id: terraform-init
+        run: |
+          if [ -z "${{ inputs.backend_config }}" ]; then
+            terraform init -input=false
+          else
+            terraform init -input=false -backend-config=${{ inputs.backend_config }}
+          fi
+
+      # Comment back to the GitHub PR the output of the Terraform Init (if failed)
+      - name: Update Pull Request - Terraform Init output (if failed)
+        id: pr-update-init-fail
+        if: github.event_name == 'pull_request' && steps.terraform-init.outcome == 'failure'
+        uses: Jimdo/terraform-pr-commenter@main
+        with:
+          commenter_type: init
+          commenter_input: ${{ format('{0}{1}', steps.terraform-init.outputs.stdout, steps.terraform-init.outputs.stderr) }}
+          commenter_exitcode: ${{ steps.terraform-init.outputs.exitcode }}
+
+      - name: Terraform Validate
+        id: terraform-validate
+        run: terraform validate
+
+      # Comment back to the GitHub PR the output of the Terraform Validate
+      - name: Update Pull Request - Terraform Validate output (if failed)
+        id: pr-update-validate-fail
+        if: github.event_name == 'pull_request' && steps.terraform-validate.outcome == 'failure'
+        uses: Jimdo/terraform-pr-commenter@main
+        with:
+          commenter_type: validate
+          commenter_input: ${{ format('{0}{1}', steps.terraform-validate.outputs.stdout, steps.terraform-validate.outputs.stderr) }}
+          commenter_exitcode: ${{ steps.terraform-validate.outputs.exitcode }}
+
+      - name: Terraform Plan
+        id: terraform-plan-run
+        run: terraform plan -var-file=../environments/${{ inputs.environment }}.tfvars -input=false -no-color -out ${{ inputs.environment }}-plan.out
+
+      # Save plan to artifacts
+      - name: Upload Terraform Plan File
+        id: terraform-plan-artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ inputs.environment }}-plan.out
+          path: terraform/${{ inputs.environment }}-plan.out
+          retention-days: 5
+          if-no-files-found: warn
+
+      # Comment back to the GitHub PR the output of the Terraform Plan
+      - name: Update Pull Request - Terraform Plan output
+        id: pr-update-pull
+        if: github.event_name == 'pull_request' && (steps.terraform-plan-run.outcome == 'success' || steps.terraform-plan-run.outcome == 'failure')
+        uses: Jimdo/terraform-pr-commenter@main
+        with:
+          commenter_type: plan
+          commenter_input: ${{ format('{0}{1}', steps.terraform-plan-run.outputs.stdout, steps.terraform-plan-run.outputs.stderr) }}
+          commenter_exitcode: ${{ steps.terraform-plan-run.outputs.exitcode }}
+
+  ## Run the workflow output summary page
+  workflow-summary:
+   needs:
+     - terraform-format
+     - terraform-docs
+     - terraform-lint
+     - terraform-trivy
+     - infracost
+     - terraform-plan
+   name: Output
+   runs-on: ${{ fromJSON(inputs.github_runner) }}
+   defaults:
+     run:
+       working-directory: .
+   steps:
+     - name: Workflow Summary
+       env:
+         TF_FMT_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.terraform-format.outputs.terraform-format-outcome != 'success'] }}
+         TF_DOCS_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.terraform-docs.outputs.terraform-docs-outcome != 'success'] }}
+         TF_LINT_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.terraform-lint.outputs.terraform-lint-outcome != 'success'] }}
+         TF_TRIVY_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.terraform-trivy.outputs.terraform-trivy-outcome != 'success'] }}
+         TF_PLAN_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.terraform-plan.outputs.terraform-plan-outcome != 'success'] }}
+         INFRACOST_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.infracost.outputs.infracost-outcome != 'success'] }}
+       run: |
+         echo '### WORKFLOW SUMMARY :octocat:' >> $GITHUB_STEP_SUMMARY
+         echo '' >> $GITHUB_STEP_SUMMARY
+         echo '| result | job |' >> $GITHUB_STEP_SUMMARY
+         echo '|---|---|' >> $GITHUB_STEP_SUMMARY
+         echo '| ${{ env.TF_FMT_RESULT }} | terraform format |' >> $GITHUB_STEP_SUMMARY
+         echo '| ${{ env.TF_DOCS_RESULT }} | terraform docs |' >> $GITHUB_STEP_SUMMARY
+         echo '| ${{ env.TF_LINT_RESULT }} | terraform lint |' >> $GITHUB_STEP_SUMMARY
+         echo '| ${{ env.TF_TRIVY_RESULT }} | trivy |' >> $GITHUB_STEP_SUMMARY
+         echo '| ${{ env.TF_PLAN_RESULT }} | terraform plan |' >> $GITHUB_STEP_SUMMARY
+         echo '| ${{ env.INFRACOST_RESULT }} | infracost |' >> $GITHUB_STEP_SUMMARY
